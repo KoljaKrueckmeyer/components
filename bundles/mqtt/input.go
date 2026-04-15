@@ -4,11 +4,13 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
-	mqtt "github.com/eclipse/paho.mqtt.golang"
-	"github.com/wombatwisdom/components/framework/spec"
 	"maps"
 	"net/url"
 	"sync"
+	"time"
+
+	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/wombatwisdom/components/framework/spec"
 )
 
 type InputConfig struct {
@@ -25,6 +27,10 @@ type InputConfig struct {
 
 	// EnableAutoAck enables automatic acknowledgment for at-least-once delivery (paho SetAutoAckDisabled)
 	EnableAutoAck bool
+
+	// SessionStabilizationDelay is an optional delay after connection before subscribing
+	// This helps ensure broker-side session state is fully initialized (useful for Apache Artemis)
+	SessionStabilizationDelay *time.Duration
 }
 
 func NewInput(env spec.Environment, config InputConfig) (*Input, error) {
@@ -41,6 +47,9 @@ type Input struct {
 
 	msgChan     chan mqtt.Message
 	msgChanLock sync.Mutex
+
+	subscribed     bool
+	subscribedLock sync.Mutex
 
 	log spec.Logger
 }
@@ -69,26 +78,24 @@ func (m *Input) Init(ctx spec.ComponentContext) error {
 		SetCleanSession(m.CleanSession).
 		SetConnectionLostHandler(func(client mqtt.Client, reason error) {
 			m.log.Errorf("Connection lost due to: %v\n", reason)
+			// Mark as unsubscribed so reconnection handler will re-subscribe
+			m.subscribedLock.Lock()
+			m.subscribed = false
+			m.subscribedLock.Unlock()
 		}).
 		SetOnConnectHandler(func(client mqtt.Client) {
 			m.log.Infof("Connected to MQTT broker")
 
-			tok := client.SubscribeMultiple(m.Filters, func(_ mqtt.Client, msg mqtt.Message) {
-				msgMut.Lock()
-				defer msgMut.Unlock()
+			// For reconnections, re-subscribe after connection is established
+			m.subscribedLock.Lock()
+			wasSubscribed := m.subscribed
+			m.subscribedLock.Unlock()
 
-				if msgChan != nil {
-					select {
-					case msgChan <- msg:
-					case <-ctx.Context().Done():
-					}
+			if wasSubscribed {
+				m.log.Infof("Reconnected - re-subscribing to topics")
+				if err := m.subscribe(client, msgChan, &msgMut, ctx); err != nil {
+					m.log.Errorf("Failed to re-subscribe after reconnection: %v", err)
 				}
-			})
-			tok.Wait()
-			if err := tok.Error(); err != nil {
-				m.log.Errorf("Failed to subscribe to topics '%v': %v", maps.Keys(m.InputConfig.Filters), err)
-				m.log.Errorf("Shutting connection down.")
-				m.closeMsgChan()
 			}
 		}).
 		SetReconnectingHandler(func(_ mqtt.Client, _ *mqtt.ClientOptions) {
@@ -102,9 +109,30 @@ func (m *Input) Init(ctx spec.ComponentContext) error {
 
 	client := mqtt.NewClient(opts)
 
+	// Connect and wait for completion
 	tok := client.Connect()
 	tok.Wait()
 	if err := tok.Error(); err != nil {
+		return err
+	}
+
+	m.client = client
+	m.msgChan = msgChan
+
+	// Apply session stabilization delay if configured
+	// This ensures broker-side session state is fully initialized before subscribing
+	if m.SessionStabilizationDelay != nil && *m.SessionStabilizationDelay > 0 {
+		m.log.Infof("Waiting %v for broker session stabilization before subscribing", *m.SessionStabilizationDelay)
+		select {
+		case <-time.After(*m.SessionStabilizationDelay):
+		case <-ctx.Context().Done():
+			return ctx.Context().Err()
+		}
+	}
+
+	// Perform initial subscription after connection is fully established
+	if err := m.subscribe(client, msgChan, &msgMut, ctx); err != nil {
+		client.Disconnect(0)
 		return err
 	}
 
@@ -113,8 +141,37 @@ func (m *Input) Init(ctx spec.ComponentContext) error {
 		}
 	}()
 
-	m.client = client
-	m.msgChan = msgChan
+	return nil
+}
+
+// subscribe performs the actual subscription to configured topics
+func (m *Input) subscribe(client mqtt.Client, msgChan chan mqtt.Message, msgMut *sync.Mutex, ctx spec.ComponentContext) error {
+	m.log.Infof("Subscribing to topics: %v", maps.Keys(m.Filters))
+
+	tok := client.SubscribeMultiple(m.Filters, func(_ mqtt.Client, msg mqtt.Message) {
+		msgMut.Lock()
+		defer msgMut.Unlock()
+
+		if msgChan != nil {
+			select {
+			case msgChan <- msg:
+			case <-ctx.Context().Done():
+			}
+		}
+	})
+
+	tok.Wait()
+	if err := tok.Error(); err != nil {
+		m.log.Errorf("Failed to subscribe to topics '%v': %v", maps.Keys(m.Filters), err)
+		m.closeMsgChan()
+		return err
+	}
+
+	m.subscribedLock.Lock()
+	m.subscribed = true
+	m.subscribedLock.Unlock()
+
+	m.log.Infof("Successfully subscribed to topics: %v", maps.Keys(m.Filters))
 	return nil
 }
 

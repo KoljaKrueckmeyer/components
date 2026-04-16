@@ -87,15 +87,27 @@ func (m *Input) Init(ctx spec.ComponentContext) error {
 			m.log.Infof("Connected to MQTT broker")
 
 			// For reconnections, re-subscribe after connection is established
+			// Only re-subscribe if we were previously subscribed (connection was lost)
 			m.subscribedLock.Lock()
 			wasSubscribed := m.subscribed
 			m.subscribedLock.Unlock()
 
-			if wasSubscribed {
-				m.log.Infof("Reconnected - re-subscribing to topics")
-				if err := m.subscribe(client, msgChan, &msgMut, ctx); err != nil {
-					m.log.Errorf("Failed to re-subscribe after reconnection: %v", err)
-				}
+			if !wasSubscribed {
+				// First connection - subscription will be done in Init() after stabilization delay
+				return
+			}
+
+			// This is a reconnection - re-subscribe immediately
+			m.log.Infof("Reconnected - re-subscribing to topics")
+
+			// Apply stabilization delay for reconnections too if configured
+			if m.SessionStabilizationDelay != nil && *m.SessionStabilizationDelay > 0 {
+				m.log.Infof("Waiting %v for broker session stabilization before re-subscribing", *m.SessionStabilizationDelay)
+				time.Sleep(*m.SessionStabilizationDelay)
+			}
+
+			if err := m.subscribe(client, msgChan, &msgMut, ctx); err != nil {
+				m.log.Errorf("Failed to re-subscribe after reconnection: %v", err)
 			}
 		}).
 		SetReconnectingHandler(func(_ mqtt.Client, _ *mqtt.ClientOptions) {

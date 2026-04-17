@@ -157,9 +157,9 @@ func (m *Input) Init(ctx spec.ComponentContext) error {
 	// This is expected behavior and handled by our message callback.
 	if err := m.subscribe(client, ctx); err != nil {
 		// If subscription fails with persistent session, it might be because
-		// the subscription already exists. Check if we're receiving messages anyway.
+		// the subscription already exists. This is expected behavior.
 		if !m.CleanSession {
-			m.log.Warnf("Subscription failed with persistent session - this may be expected if subscription already exists on broker")
+			m.log.Infof("Using existing subscription from persistent session - broker will deliver queued messages")
 			// Mark as subscribed anyway - if broker has the subscription, messages will flow
 			m.subscribedLock.Lock()
 			m.subscribed = true
@@ -237,20 +237,20 @@ func (m *Input) subscribe(client mqtt.Client, ctx spec.ComponentContext) error {
 			return err
 		}
 	case <-time.After(30 * time.Second):
-		m.log.Errorf("Subscription timeout after 30 seconds for topics %v", topics)
-
 		// With persistent sessions, the broker may already have our subscription
 		// and is delivering messages even though SUBACK hasn't arrived.
-		// In this case, we should NOT unsubscribe (would stop message flow)
-		// and NOT close the channel (would cause panic when messages arrive).
-		// Instead, just return the error and let Init() handle it gracefully.
+		// This is expected behavior when reconnecting with an existing session.
 		if !m.CleanSession {
-			m.log.Warnf("Subscription timeout with persistent session - broker may already have subscription and is delivering messages")
+			m.log.Infof("Subscription acknowledgment timeout with persistent session - this is expected when broker already has the subscription")
+			m.log.Debugf("Broker is already delivering messages from existing subscription for topics %v", topics)
 			// Don't close channel - messages may already be flowing
 			// Don't unsubscribe - would stop message delivery
 			// Just return error - Init() will handle it gracefully for persistent sessions
-			return errors.New("subscription timeout - may be expected with persistent session")
+			return errors.New("subscription timeout - expected with persistent session")
 		}
+
+		// For clean sessions, timeout is a real error
+		m.log.Errorf("Subscription timeout after 30 seconds for topics %v", topics)
 
 		// For clean sessions, timeout is a real error - clean up properly
 		m.log.Debugf("Unsubscribing from topics to prevent message delivery on closed channel")

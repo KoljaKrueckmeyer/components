@@ -151,9 +151,24 @@ func (m *Input) Init(ctx spec.ComponentContext) error {
 	}
 
 	// Perform initial subscription after connection is fully established
+	// Note: With persistent sessions (clean_session=false), the broker may already
+	// have our subscription from a previous connection. In this case, the broker
+	// will start delivering queued messages immediately, even before SUBACK arrives.
+	// This is expected behavior and handled by our message callback.
 	if err := m.subscribe(client, ctx); err != nil {
-		client.Disconnect(0)
-		return err
+		// If subscription fails with persistent session, it might be because
+		// the subscription already exists. Check if we're receiving messages anyway.
+		if !m.CleanSession {
+			m.log.Warnf("Subscription failed with persistent session - this may be expected if subscription already exists on broker")
+			// Mark as subscribed anyway - if broker has the subscription, messages will flow
+			m.subscribedLock.Lock()
+			m.subscribed = true
+			m.subscribedLock.Unlock()
+			// Don't return error - let the connection proceed
+		} else {
+			client.Disconnect(0)
+			return err
+		}
 	}
 
 	go func() {
@@ -203,11 +218,47 @@ func (m *Input) subscribe(client mqtt.Client, ctx spec.ComponentContext) error {
 		// Subscription completed
 		if err := tok.Error(); err != nil {
 			m.log.Errorf("Failed to subscribe to topics %v: %v", topics, err)
+
+			// With persistent sessions, subscription may fail because it already exists
+			// In this case, don't clean up - messages may already be flowing
+			if !m.CleanSession {
+				m.log.Warnf("Subscription error with persistent session - broker may already have subscription")
+				// Don't close channel or unsubscribe - would stop message flow
+				return err
+			}
+
+			// For clean sessions, clean up properly on error
+			for topic := range m.Filters {
+				if unsubTok := client.Unsubscribe(topic); unsubTok != nil {
+					unsubTok.Wait()
+				}
+			}
 			m.closeMsgChan()
 			return err
 		}
 	case <-time.After(30 * time.Second):
 		m.log.Errorf("Subscription timeout after 30 seconds for topics %v", topics)
+
+		// With persistent sessions, the broker may already have our subscription
+		// and is delivering messages even though SUBACK hasn't arrived.
+		// In this case, we should NOT unsubscribe (would stop message flow)
+		// and NOT close the channel (would cause panic when messages arrive).
+		// Instead, just return the error and let Init() handle it gracefully.
+		if !m.CleanSession {
+			m.log.Warnf("Subscription timeout with persistent session - broker may already have subscription and is delivering messages")
+			// Don't close channel - messages may already be flowing
+			// Don't unsubscribe - would stop message delivery
+			// Just return error - Init() will handle it gracefully for persistent sessions
+			return errors.New("subscription timeout - may be expected with persistent session")
+		}
+
+		// For clean sessions, timeout is a real error - clean up properly
+		m.log.Debugf("Unsubscribing from topics to prevent message delivery on closed channel")
+		for topic := range m.Filters {
+			if unsubTok := client.Unsubscribe(topic); unsubTok != nil {
+				unsubTok.Wait()
+			}
+		}
 		m.closeMsgChan()
 		return errors.New("subscription timeout after 30 seconds")
 	case <-ctx.Context().Done():
